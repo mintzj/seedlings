@@ -1,0 +1,14 @@
+Files used in analysis:
+
+./Data/seedling_measurements.csv 
+	Contains majority of measurements made by Bela and Luke's teams.  
+	Based on earlier file "data\HF\All_combined\Bellas_project_data.csv"
+
+./Data/HF_seedling_2023_quad_data_fix.xlsx
+	
+	Based on file "data\HF\All_combined\HF_seedling_2023_quad_data_fix.xlsx"
+
+
+./Data/dat_HF_new22_after_23.xlsx
+	A few additional seedlings that were measured for the first time in 2023. 
+	Based on file "data\HF_seedling_2023_quad_data_fix.xlsx"

@@ -1,0 +1,1750 @@
+---
+format: html
+title: Seedling growth and survival models and simulation
+toc: true
+toc-location: right
+self-contained: true
+self-contained-math: true
+execute: 
+  echo: true
+message: false
+warning: false
+editor_options: 
+  chunk_output_type: console
+---
+
+# Background
+
+```{r}
+#| label: Settings
+#| code-fold: true
+#| code-summary: Settings
+
+# setwd(dir = "../")  # Only run this line when running manually.  Only for knitting.
+
+set.seed(400)
+boots = 100 # 0  #fast: 100, full: 1000
+min_grow = -2
+max_grow = Inf
+bootsize = 50
+breakage = T
+seedling_variance = T
+gap22 = T
+min_h = 2
+canopy = 1:2 # 1:3  # second option.
+canopy_types = c("Closed","Partial", "Open")
+
+# Simulation settings:
+n_seedling = 500    # Fast: 500 (ART 7m @ 100 trials) Full: 250,000
+timesteps  = 100    # Number of time steps
+trials     = 100     # Fast: 5, Full: 100
+sample_curves = T
+
+mid_lim <- c(20, 200)
+
+simulate_gompertz = F
+simulate_ricker = F
+
+sim_id = Sys.Date()
+store_simulation = F
+
+
+spp_names = spp = c("ACERUB", "BETSP", "PINSTR", "QUERUB", "TSUCAN")
+
+if(identical(canopy, c(1:2))){
+  # Two class option.
+  canopy1 = c("1", "1,2", "2,1", "2", "2,3")
+  canopy2 = c("3,2", "3", "3,4", "4,3", "4", "4,5", "5,4", "5")
+  canopy_types = c("Closed", "Open")
+  
+  canopy_list <- list(canopy1, canopy2)
+  
+}else{
+  # Three-class option
+  canopy = 1:3
+  class1 = c("1", "1,2", "2,1", "2")
+  class2 = c("2,3", "3,2", "3", "3,4", "4,3", "4")
+  class3 = c("3", "3,4", "4,3", "4",  "4,5", "5,4", "5")
+  
+  canopy_list <- list(class1, class2, class3)
+}
+
+crown_classes = unlist(canopy_list)
+canopy_classes = factor(rep(1:length(canopy_list), unlist(lapply(canopy_list, length))))
+
+spp_max_surv <- c(ACERUB = 0.87, BETSP = 0.91, PINSTR = 0.812, QUERUB = 0.68, TSUCAN = 0.947-0.045)
+# spp_max_surv <- c(ACERUB = 0.87, BETSP = 0.91, PINSTR = 0.812, QUERUB = 0.68, TSUCAN = 0.947)
+
+# NLRQ quantile
+tau = 0.9
+
+# Display options
+pander::panderOptions('table.split.table', Inf) 
+```
+
+Five species were compared (`r pander::pander(spp)`),  across `r xfun::numbers_to_words(length(canopy_list))` canopy conditions.  For each plot containing seedlings, canopy conditions were assessed `r c("", "during 2022")[gap22 + 1]` on a scale of 1 (full canopy) to 5 (full gap).  Seedlings in plots which fell on the boundary were given an ordered pair (e.g. 1,2), with the first number indicating the more likely canopy group.  Any seedling with a rank of `r tail(canopy_list, 1)[[1]][1]` or higher was considered to be in open canopy. 
+
+For curve fitting we drew `r boots` bootstraps of size, bootstrap size `r bootsize` from each species by gap class.  
+
+Data limitations: Minimum seedling height for inclusion `r min_h`
+Growth limits: min growth `r min_grow`, max growth `r max_grow`, breakage `r breakage`, individual seedling variance `r seedling_variance`.  We considered growth models from the class of three parameter logistic functions.  `r c("", "Ricker models were also included.")[simulate_ricker + 1]` `r c("", "  Gompertz models were also included.")[simulate_gompertz + 1]`
+
+Max survival rates were:
+
+`r pander::pander(spp_max_surv)`
+
+
+The results below are for a simulation wit `r n_seedling` seedlings per simulation, `r timesteps` number of years, and `r trials` trials.  Curve resampling was `r c("off", "on")[sample_curves + 1]`, and data logging to disk was `r c("off", "on")[store_simulation + 1]`. Breakage in the model was `r c("Off", "On")[breakage + 1]` and the minimum growth breakage threshold was `r min_grow` .
+
+## Setup
+
+```{r}
+#| label: Libraries and functions
+#| code-fold: true
+#| code-summary: Setup
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(pander)
+library(quantreg)
+library(nlraa)
+library(purrr)
+library(reshape2)
+library(boot)
+library(car)
+
+# Color grid for canopy
+canopy_color <- c("#ff504d", "#d6a738", "#76c754")
+
+d <- read.csv("../Data/seedling_measurements.csv")
+quad <- read_xlsx("../Data/HF_seedling_2023_quad_data_fix.xlsx") 
+quad <- quad[,-2]
+d.new23 <- read_xlsx(path = "../Data/dat_HF_new22_after_23.xlsx")
+d.new23 <- d.new23 %>% rename(Unique_plot_23 = Unique_Plot, 
+                              Submission.Id_2023 = `Submission Id`, 
+                              Species_23 = Species,
+                              HT_23 = `Height_2023_(cm)`,
+                              ST_23 = Status_2023) %>%
+  mutate(Unique_Tag = paste(Unique_plot_23, Tag, sep = "."),
+         HT_22 = as.numeric(Height_2022),
+         ST_22 = "A",
+         Status_2022 = "A",
+         ST_21 = NA, HT_21 = NA, 
+         Notes_21 = NA, Quad_Notes_2022 = NA,
+         Sumbission.Id_2021 = NA, Crown_Class_22 = NA)
+
+# Repair to unique plot numbers:
+quad$Unique_plot_23[which(!is.na(quad$Unique_plot_fix_23))] <- quad$Unique_plot_fix_23[which(!is.na(quad$Unique_plot_fix_23))]
+
+# Functions ---------------------
+
+# Survival:
+# Odds, for use in max survival function.
+odds <- function(p){
+  p / (1 - p)
+}
+
+# Convert average species survival, light class mean survival, and species max survival to light class max survival.
+max_surv <- function(species_max, species_mean, species_canopy_mean){
+  OR <- odds(species_max) / odds(species_mean)
+  sp_can_max_odds <- odds(species_canopy_mean) * OR
+  sp_can_max_p <- sp_can_max_odds / (1 + sp_can_max_odds)
+  return(sp_can_max_p)
+}
+
+# Bootstrapping -----------------
+boot_stat <- function(new_dat, new_start, ...){
+  logis_i <- try(nls(y ~ SSlogis(x, a, b, c), 
+                     data = new_dat, start = start_li))
+  
+  if(is.character(logis_i)){
+    return(c(a = NA, b = NA, c = NA))
+  }else{
+    if(is.list(logis_i)){
+      # GLM
+      return(coef(logis_i))
+    }else{
+      # Optim
+      return(logis_i$par)
+    }
+    
+  }
+  
+}
+
+boot_ricker <- function(new_dat, new_start, ...){
+  rick_i <- try(nls(y ~ SSricker(x, a, b), 
+                    data = new_dat, start = start_ri, ...))
+  
+  if(is.character(rick_i)){
+    return(c(a = NA, b = NA))
+  }else{
+    return(coef(rick_i))
+  }
+}
+
+boot_gompertz <- function(new_dat, new_start, ...){
+  gomp_i <- try(nls(y ~ SSgompertz(x, a, b, c), 
+                    data = new_dat, start = start_gi, ...))
+  
+  if(is.character(gomp_i)){
+    return(c(a = NA, b = NA, c = NA))
+  }else{
+    return(coef(gomp_i))
+  }
+}
+
+boot_rand <- function(new_dat, mle = NA){
+  return(sample_n(new_dat, size = bootsize, replace = T))
+}
+
+# Logistic ----------------------
+
+logis <- function(x, params){
+  params[[1]] / (1 + exp((params[[2]]- x) / params[[3]]))
+}
+
+fit_logis <- function(params, x, y){
+  est_y <- logis(x, params)
+  loss <- sum((y - est_y)^2, na.rm = T)
+  return(loss)
+}
+
+# Medoids
+find_medoid <- function(mat){
+  dmat <- dist(mat)
+  mdmat <- as.matrix(dmat)
+  sum_dists <- apply(mdmat, MARGIN = 1, FUN = sum, na.rm = T)
+  nonzero_dist <- which(sum_dists > 0)
+  min_index <- which(sum_dists[nonzero_dist] == min(sum_dists[nonzero_dist]))[[1]]
+  most_central <- mat[as.numeric(names((sum_dists[nonzero_dist])[min_index])), ]
+  return(most_central)
+}
+
+# Plotting ----------------------
+
+#' A single plot show the fitted curves from bootstrapped parameters, overlaid on data.
+plot_logis <- function(dat, boot, alph = 22, point_alpha = 0.25, add = F, col = "#77777733", ...){
+  
+  fit_par <- apply(boot, MARGIN = 2, FUN = median, na.rm = T)
+  names(fit_par) <- c("a", "b", "c")
+  
+  if (add == F){
+    plot(dat, xlab = "Height", ylab = "Growth", pch = 20, 
+         col = alpha(col, alpha = point_alpha), ...)
+    
+  } else{
+    points(dat, pch = 20, col = alpha(col, alpha = point_alpha), ...)
+  }
+  
+  fit_curves <- which(complete.cases(boot))
+  for(fi in fit_curves){
+    lines(x = xgrid, y = SSlogis(input = xgrid, 
+                                 Asym = boot[fi, 1], 
+                                 xmid = boot[fi, 2], 
+                                 scal = boot[fi, 3]), 
+          lwd = 2, col = col, ...)
+  }
+  
+  lines(x = xgrid, 
+        y = SSlogis(input = xgrid, 
+                    Asym = fit_par[["a"]], 
+                    fit_par[["b"]], 
+                    scal = fit_par[["c"]]), 
+        col = alpha(col, alpha = 1),
+        lwd = 2)
+  
+}
+
+
+#'  Plot showing curve fit by species and light class overlaid on data
+#'  
+plot_spp <- function(si, line_alpha = 0.05, point_alpha = 0.05, max_grow = 40){
+  ci = 1
+  
+  if(gap22){
+    
+    A21_i  <- 
+      subset(A, A$Species_23 == spp[si] & A$Crown_Class_22 %in% 
+               canopy_list[[ci]]) %>% 
+      filter(grow21 > min_grow, HT_21 >= min_h)
+    
+    A22_i  <- 
+      subset(A, A$Species_23 == spp[si] & A$Crown_Class_22 %in%
+               canopy_list[[ci]]) %>% 
+      filter(grow > min_grow, HT_22 >= min_h)
+    
+  }else{
+    
+    A21_i  <- 
+      subset(A, A$Species_23 == spp[si] & A$Crown_Class_22 %in%
+               canopy_list[[ci]]) %>% 
+      filter(grow21 > min_grow, HT_21 >= min_h)
+    
+    A22_i  <- 
+      subset(A, A$Species_23 == spp[si] & A$Crown_Class_22 %in%
+               canopy_list[[ci]]) %>% 
+      filter(grow > min_grow, HT_22 >= min_h)
+  }
+  
+  
+  dat_i = data.frame(x = c(A22_i$HT_22, A21_i$HT_21), 
+                     y = c(A22_i$grow,  A21_i$grow21))
+  
+  plot_logis(dat = dat_i, boot = dat[[si]][[ci]]$logistic.boot$t, 
+             main = paste(spp[si]), add = F, 
+             ylim = c(min_grow, max_grow), 
+             col = alpha(canopy_color[ci], alpha = line_alpha), 
+             point_alpha = point_alpha)
+  
+  for (ci in 2:length(canopy)){
+    A21_i  <- 
+      subset(A, A$Species_23 == spp[si] & A$Crown_Class_22 %in%
+               canopy_list[[ci]]) %>% 
+      filter(grow21 > min_grow, HT_22 >= min_h)
+    
+    A22_i  <- 
+      subset(A, A$Species_23 == spp[si] & A$Crown_Class_23 %in%
+               canopy_list[[ci]]) %>% 
+      filter(grow > min_grow, HT_22 >= min_h)
+    
+    dat_i = data.frame(x = c(A22_i$HT_22, A21_i$HT_21), 
+                       y = c(A22_i$grow, A21_i$grow21))
+    
+    plot_logis(dat = dat_i, 
+               boot = dat[[si]][[ci]]$logistic.boot$t, add = T, 
+               col = alpha(canopy_color[ci], alpha = line_alpha), 
+               point_alpha = point_alpha)
+    
+  }
+  
+}
+
+plot_par <- function(par_dat, probs = c(0.05, 0.95), par_names){
+  par_initial = par("mfrow")
+  npar <- ncol(par_dat)
+  par(mfrow = c(1, npar))
+  for(par_i in 1:npar){
+    par_dat_i <- par_dat[ , par_i]
+    dat_quant <- quantile(par_dat_i, probs = probs, na.rm = T)
+    hist(par_dat[
+      (par_dat_i > dat_quant[1]) & (par_dat_i < dat_quant[2])], 
+         freq = T, main = par_names[par_i], xlab = "")
+  }
+  par(mfrow = par_initial)
+}
+
+
+
+
+```
+
+
+
+
+```{r}
+#| label: Cleanup
+#| code-fold: true
+#| code-summary: Data cleaning
+
+# Omitted reference to Height_2022. 
+
+# Which of these would be flagged on their own?
+d[which(d$Unique_Tag == "340694_120_6.50"), "HT_22"] <- 25  # 25 not 2.5
+
+d[which(d$Unique_Tag == "120313_120_2.76"), "HT_21"] <- NA  # Reading error.
+d[which(d$Unique_Tag == "330876_0_6.38"), c("HT_21")]  <- 11   # 8, 14, 14 -> 11, 14, 14 Based on note
+d[which(d$Unique_Tag == "330876_0_6.59"), c("HT_21")]  <- 12   # 7, 15, NA -> 12, 15, NA Based on note
+d[which(d$Unique_Tag == "120313_0_2.85"), c("HT_21")]  <- 10   # 7, 12, 10 -> 10, 12, 10 Based on note
+
+
+# More Querub fixes from "delta_growth.R
+d[which(d$Unique_Tag == "022156_120_2.68"), "HT_22"]       <- 9       # 19, 90, 11 -> 19, 9, 11 
+d[which(d$Unique_Tag == "351355_120_2.38"), c("HT_22")]  <- 21.5      # 20, 2.5, 22.5 -> 20, 21.5, 22.5
+d[which(d$Unique_Tag == "171421_240_6.64"), c("HT_22")]  <- NA        # 14, 30.5, 15.5 ... What is the middle point? No break note.
+d[which(d$Unique_Tag == "120313_0_2.64"), c("HT_21")]  <- 9      # 89,  12, 10  -> 9,  12, 10  Querub Based on note
+d[which(d$Unique_Tag == "061110_120_2.26"), c("HT_21")]  <- 10   # 100, 13, 19  -> 10, 13, 19 Acerub Based on note
+d[which(d$Unique_Tag == "151940_240_2.7"), c("HT_21")]   <- 15   # 18,  17, 16  -> 15, 17, 16 Querub Based on note
+d[which(d$Unique_Tag == "120313_0_2.85"), c("HT_21")]    <- 10   # 7,   12, 10  -> 10, 12, 10 Querub Based on note
+
+# Other species
+d[which(d$Unique_Tag == "061285_120_6.89"), c("HT_21")]  <- 27   # 107, 30, 31  -> 27, 30, 31   Tsucan Based on note
+d[which(d$Unique_Tag == "070230_120_6.74"), c("HT_21")]  <- 8    # 80, 10, 10.5 -> 8, 10, 10.5  Acerub Based on note
+d[which(d$Unique_Tag == "070864_120_6.NA"), c("HT_21")]  <- 8    # 80, 8.5, 11  -> 80, 8.5, 11  Acerub Based on note
+d[which(d$Unique_Tag == "070864_0_6.48"), c("HT_21")]    <- 38   # 78, 40, 42   -> 38, 40, 42   Tsucan Based on note
+d[which(d$Unique_Tag == "040979_240_2.86"), c("HT_22")]   <- 5.5   # 4, 55, 6   -> 4, 5.5, 6    Acerub note
+d[which(d$Unique_Tag == "061285_0_6.8"), c("HT_22")]   <- NA       # Betsp: 142, 17, 141 -> 142, NA, 141 (No notes)
+
+d[which(d$Unique_Tag == "171421_240_2.51"), c("HT_21", "HT_22")]   <- NA  # 78, 74, NA   Pinstr high leverage point
+
+# Edits from 4/20/24
+d[which(d$Unique_Tag == "261713_240_6.61"), c("HT_21")]   <- 152   # 125, 157, NA -> 152, 157, NA
+d[which(d$Unique_Tag == "070864_0_6.95"),   c("HT_21")]   <- 85    # 65, 96, 91 -> 65, 85, 91
+d[which(d$Unique_Tag == "070864_0_2.17"),   c("HT_22")]   <- 24    #  4, 28, 41 -> 24, 28, 41
+d[which(d$Unique_Tag == "080956_240_2.20"),   c("HT_22")]   <- 181 #  170, 191, 178 -> 170, 181, 178
+d[which(d$Unique_Tag == "311758_120_6.3"),   c("HT_23")]    <- 27  #  10, 24, 2.7 -> 10, 24, 27
+d[which(d$Unique_Tag == "070864_0_6.11"),   c("HT_22")]     <- 37  #  36, 47, 37 -> 36, 37, 37
+d[which(d$Unique_Tag == "101052_120_2.74"),   c("HT_21")]   <- 4   #  2, 5.5, 7  -> 4, 5.5, 7
+
+d[which(d$Unique_Tag == "040979_120_2.20"),   c("HT_22")]   <- 16  #  6, 6, 25 -> 6, 16, 25  
+d[which(d$Unique_Tag == "080956_120_6.71"),   c("HT_21")]   <- 4   #  6, 4.5, 5 -> 4, 4.5, 5 
+d[which(d$Unique_Tag == "191191_0_6.7"),   c("HT_21")]      <- 8   #  6, 12, NA -> 8, 12, NA 
+d[which(d$Unique_Tag == "091455_0_2.155"),   c("HT_21")]    <- NA  #  5, 11, 11 -> NA, 11, 11
+d[which(d$Unique_Tag == "061110_240_2.6"),   c("HT_21")]    <- 29  #  39, 31, 34.5 -> 29, 31, 34.5
+d[which(d$Unique_Tag == "091572_0_2.58"),   c("HT_21")]     <- 128 #  148, 135, 162 -> 128, 135, 162
+d[which(d$Unique_Tag == "171421_0_2.96"),   c("HT_21")]     <- 16  #  11, 20, 17.5 -> 16, 20, 17.5  
+d[which(d$Unique_Tag == "061110_120_2.45"),   c("HT_21")]   <- 16  #  18, 18, 18 -> 16, 18, 18    
+d[which(d$Unique_Tag == "330876_120_2.90"),   c("HT_21")]   <- 19  #  11, 21, 23 -> 19, 21, 23    
+d[which(d$Unique_Tag == "061110_120_2.40"),   c("HT_21")]   <- 28  #  38, 30, 32 -> 28, 30, 32    
+d[which(d$Unique_Tag == "040979_120_2.54"),   c("HT_21")]   <- 34  #  44, 44, 35 -> 34, 44, 35    
+d[which(d$Unique_Tag == "022156_240_2.10"),   c("HT_21")]   <- 5   #   7,  6, NA ->  5,  6, NA    
+d[which(d$Unique_Tag == "140286_0_2.67"),     c("HT_21")]   <- 6.5 #  2, NA, NA  -> 6.5, NA, NA   
+d[which(d$Unique_Tag == "061110_240_2.20"),   c("HT_21")]   <- 7   #  12, 8.5, 12 ->  7, 8.5, 12  
+d[which(d$Unique_Tag == "291578_120_6.12"),   c("HT_21")]   <- 8   #   4, 11, 12.5 -> 8, 11, 12.5 
+d[which(d$Unique_Tag == "040979_120_2.31"),   c("HT_21")]   <- 8   #   5, 11, 12   -> 8, 11, 12    
+d[which(d$Unique_Tag == "260982_0_2.61"),   c("HT_21")]    <- 135  # 145, 148, 150.5 -> 135, 148, 150.5
+d[which(d$Unique_Tag == "260982_0_2.38"),   c("HT_21")]    <- 180  # 220, 209, 211.5 -> 180, 209, 211.5
+d[which(d$Unique_Tag == "091455_240_6.3"),   c("HT_21")]   <- 15   #  10, 18, 25 -> 15, 18, 25    
+d[which(d$Unique_Tag == "072007_120_2.31"),   c("HT_21")]   <- 6   #   9,  9, 10 ->  6,  9, 10    
+
+
+d[which(d$Unique_Tag == "201215_240_6.48"),   c("HT_21")]   <- 5.5   # 30, 8.5, 10  ->  5.5, 8.5, 10
+d[which(d$Unique_Tag == "072007_240_2.48"),   c("HT_21")]   <- 10    #  7, 12, 12.5 ->  10, 12, 12.5
+d[which(d$Unique_Tag == "061110_120_2.52"),   c("HT_21")]   <- 12    # 22, 13.5, 13 ->  12, 13.5 13 
+d[which(d$Unique_Tag == "050958_0_6.92"),     c("HT_21")]   <- 6     #  3,  7.5, NA ->   6, 7.5, NA 
+d[which(d$Unique_Tag == "031421_120_6.76"),   c("HT_21")]   <- 8     #  5,  10, 11.5 ->  8, 10, 11.5
+d[which(d$Unique_Tag == "061285_0_2.13"),     c("HT_21")]   <- 54    # 64, 64, 67   ->  54, 64, 67  
+d[which(d$Unique_Tag == "120313_0_2.9"),      c("HT_21")]   <- 5     #  3, 6.5, 8.5 ->   5, 6.5, 8.5
+d[which(d$Unique_Tag == "120313_0_2.91"),     c("HT_21")]   <- 8     #  5,  10,  9  ->   8, 10, 9   
+d[which(d$Unique_Tag == "120313_0_6.95"),     c("HT_21")]   <- 6     #  4,  8,  NA  ->   6, 8, NA   
+d[which(d$Unique_Tag == "061285_0_6.49"),     c("HT_21")]   <- 88    # 98, 95, 95.5 ->  88, 95, 95.5
+
+d[which(d$Unique_Tag == "070864_120_2.88"),   c("HT_23")]   <- 8.5   # 7, 8, 88     ->  7, 8, NA (tag = 88)
+
+```
+
+
+```{r}
+#| label: Assign canopy class
+#| code-fold: true
+#| code-summary: Canopy class and final dataset preparation
+quad$canopy_22 <- quad$Crown_Class_22
+quad$canopy_23 <- quad$Crown_Class_23
+
+colnames(quad)[6] <- "Submission.Id_2023"
+quad_sub <- subset(quad, select = c("Submission.Id_2023","Crown_Class_22", "Crown_Class_23", "Unique_plot_23"))
+seedlings <- merge(d,  quad_sub, by = "Submission.Id_2023", all = F)
+
+# Importing new data for 2022-2023
+d.new23$canopy_22 <- NA
+d.new23$canopy_23 <- d.new23$Crown_Class_23
+seed.new23 <- d.new23 %>% select(names(seedlings))
+seedlings.upd <- rbind(seedlings, seed.new23)
+
+# Cleaning 
+seedlings.upd[which(seedlings.upd$Unique_Tag == "051094_0_2.48"), "Crown_Class_23"] <- "4"
+seedlings.upd[which(seedlings.upd$Unique_Tag == "080956_0_2.77"), "Crown_Class_23"] <- "3"
+seedlings.upd[which(seedlings.upd$Unique_Tag == "061285_240_2.35"), "Crown_Class_22"] <- "4"
+seedlings.upd[which(seedlings.upd$Unique_Tag == "080956_120_6.49"), c("Crown_Class_22", "Crown_Class_23")] <- "4"
+
+save(list = c("seedlings.upd"), file = "../Data/Output/seedlings.upd.Rdata")
+write.csv(x = seedlings.upd, file = "../Data/Output/seedlings.upd.csv")
+
+# # CFS designates "can't find seedling".  
+# Select seedlings alive in 2022 (for growth modeling)
+A     <- subset(seedlings.upd, seedlings.upd$ST_22 == "A")
+
+A$grow <- A$HT_23 - A$HT_22
+A$grow21 <- A$HT_22 - A$HT_21
+
+
+```
+
+# Parameter Estimation
+
+## Survival
+
+```{r}
+#| label: Survival model
+#| code-fold: true
+#| code-summary: Survival modeling
+
+A_21 <- subset(seedlings.upd, seedlings.upd$ST_21 == "A")
+A_22 <- subset(seedlings.upd, seedlings.upd$ST_22 == "A")
+
+A_21$plot <- sub("\\..*", "", A_21$Unique_Tag)
+A_22$plot <- sub("\\..*", "", A_22$Unique_Tag)
+
+dat_1 <- data.frame(
+  Unique_tag = A_21$Unique_Tag,
+  Plot = A_21$plot,
+  Tree = A_21$Tree,
+  Transect = A_21$Transect,
+  Distance = A_21$Distance,
+  sp = A_21$Species_23,
+  X = A_21$X,
+  Y = A_21$Y,
+  stat1 = A_21$ST_21,
+  stat2 = A_21$ST_22,
+  HT1 = A_21$HT_21,
+  HT2 = A_21$HT_22,
+  census = rep(1, nrow(A_21)),
+  canopy1 = A_21$Crown_Class_22
+)
+
+dat_2 <- data.frame(
+  Unique_tag = A_22$Unique_Tag,
+  Plot = A_22$plot,
+  Tree = A_22$Tree,
+  Transect = A_22$Transect,
+  Distance = A_22$Distance,
+  sp = A_22$Species_23,
+  X = A_22$X,
+  Y = A_22$Y,
+  stat1 = A_22$Status_2022,
+  stat2 = A_22$ST_23,
+  HT1 = A_22$HT_22,
+  HT2 = A_22$HT_23,
+  census = rep(1, nrow(A_22)),
+  canopy1 = A_22$Crown_Class_23
+)
+
+# Override with canopy with individual years using canopy 2022?
+if(gap22){
+  dat_1$canopy1 = A_21$Crown_Class_22  
+  dat_2$canopy1 = A_22$Crown_Class_22
+}
+
+
+dat <- rbind(dat_1, dat_2)
+
+# Treat all states other than alive as "dead", including "missing" or "can't find seedling"
+dat$surv <- ifelse(dat$stat2 =="A", yes = 1, no = 0)
+
+# For plotting logistic curves
+xgrid <- seq(from = 1, to = 150, length.out = 100)
+
+# Empty lists to store models and results
+model_list <- list()
+result_list <- list()
+
+# Empty dataframe to store the final results
+result_table <- data.frame()
+result_table_species <- data.frame()
+result_table_species_canopy <- data.frame()
+
+# Loop through each species
+i = 1
+j = 1
+
+for (i in seq_along(spp)) {
+  
+  par(mfrow = c(1,2))
+  species <- spp[i]
+  
+  # By species survival model, without light class.
+  dat_species <- dat |> filter(sp == species, stat1 == "A")
+  
+  # Create a binary outcome variable based on the canopy
+  dat_species$surv <- as.numeric(dat_species$stat2 == "A")
+  
+  # Fit logistic regression model
+  surv_sp_intercept <- glm(surv ~ 1, data = dat_species, family = "binomial")
+  
+  result_table_species <- 
+    bind_rows(result_table_species, 
+              mutate(broom::tidy(surv_sp_intercept), spp = i, n = nrow(dat_species)))
+  
+  
+  # Loop through each set of canopies
+  for (j in seq_along(canopy_list)) {
+    
+    # Subset data for the current species and Canopy
+    dat_species_canopy <- dat |> filter((sp == species) & (canopy1 %in% canopy_list[[j]]), stat1 == "A")
+    # 171421_240_2.51
+    # Create a binary outcome variable based on the canopy
+    dat_species_canopy$surv <- as.numeric(dat_species_canopy$stat2 == "A")
+    
+    # Intercept model for species x canopy combinations:
+    surv_sp_canopy_intercept <- glm(surv ~ 1, data = dat_species_canopy, family = "binomial")
+    result_table_species_canopy <- bind_rows(
+      result_table_species_canopy, 
+      mutate(broom::tidy(surv_sp_canopy_intercept), 
+             spp = i, canopy = j, n = nrow(dat_species_canopy)))
+    
+    
+    # Fit logistic regression model
+    surv_mod <- glm(surv ~ HT1, data = dat_species_canopy, family = "binomial")
+    
+    b0_i <- coef(surv_mod)[[1]]
+    b1_i <- coef(surv_mod)[[2]]
+    
+    logodds <- b0_i + xgrid * b1_i
+    prob <- exp(logodds) / (1 + exp(logodds))
+    
+    plot(x = xgrid, y = prob, type = "l", ylim = c(-0.25, 1.25), 
+         main = paste(spp[i], j), xlab = "Height (cm)", ylab = "Survival")
+    abline(h = 1, lty = "dashed", col = "grey40")
+    points(x = dat_species_canopy$HT1, 
+           y = jitter(dat_species_canopy$surv), col = "#BBAACC55", cex = 3, lwd = 2)
+    
+    
+    # Store the model in the list
+    model_list[[paste(i, "_canopy", j, sep = "")]] <- surv_mod
+    
+    # Extract and store model results
+    result_list[[paste(i, "_canopy", j, sep = "")]] <- broom::tidy(surv_mod)
+    
+    # Add the spp and canopy columns to the results dataframe
+    result_table <- bind_rows(result_table, 
+                              mutate(broom::tidy(surv_mod), spp = i, canopy = j, n = nrow(dat_species_canopy)))
+  }
+}
+
+par(mfrow = c(1, 1))
+result_table_species$surv <- plogis(result_table_species$estimate)
+result_table_species_canopy$surv <- plogis(result_table_species_canopy$estimate)
+
+```
+
+
+
+```{r}
+#| label: Max Surv
+#| code-fold: true
+#| code-summary: Maximum survival rates
+
+# Function for assigning heights by tree type
+get_ht <- function(sp_n){
+  ht <- rep(NA, length(sp_n))
+  ht[sp_n == 1] <- runif(sum(sp_n == 1), 3.5, 5.5)
+  ht[sp_n == 2] <- rnorm(sum(sp_n == 2), 2.7, .56)
+  ht[sp_n == 3] <- rnorm(sum(sp_n == 3), 5.375, 0.8717043)
+  ht[sp_n == 4] <- runif(sum(sp_n == 4), 10, 13)
+  ht[sp_n == 5] <- rnorm(sum(sp_n == 5), 3.5,  0.5431717)
+  
+  return(ht)
+}
+
+
+dat_surv <- result_table
+
+# Survival parameters
+surv_props <- data.frame(result_table_species_canopy, 
+                         surv_sp = rep(result_table_species$surv, each = length(canopy)), 
+                         surv_sp_max = rep(spp_max_surv, each = length(canopy)))
+
+surv_props$surv_sp_canopy_max <- 
+  max_surv(species_max = surv_props["surv_sp_max"], 
+           species_mean = surv_props["surv_sp"], 
+           species_canopy_mean = surv_props["surv"])[[1]]
+
+write.csv(surv_props,"../Data/Output/max_survival_params.csv", row.names = F)
+
+
+
+
+plot_dat <- data.frame()
+for (i in seq_along(spp)) {
+  species <- spp[i]
+  
+  # Loop through each set of canopies
+  for (j in seq_along(canopy_list)) {
+    
+    dat_species <- subset(dat, (sp == species) & (canopy1 %in% canopy_list[[j]]))
+    which_surv <- which((surv_props$spp == i) & (surv_props$canopy == j))
+    # Create a binary outcome variable based on the canopy
+    dat_species$surv <- as.numeric(dat_species$stat2 == "A")
+    
+    # Fit logistic regression model
+    surv_mod <- glm(surv ~ HT1, data = dat_species, family = "binomial")
+    b0_i <- coef(surv_mod)[[1]]
+    b1_i <- coef(surv_mod)[[2]]
+    
+    logodds <- b0_i + xgrid * b1_i
+    prob <- exp(logodds) / (1 + exp(logodds))
+    prob_dat <- data.frame(
+      ht = xgrid, 
+      pr = prob, 
+      pr_max = pmin(prob, surv_props$surv_sp_canopy_max[which_surv]), 
+      species = i, canopy = j)
+    plot_dat <- rbind(plot_dat, prob_dat)
+  }
+}
+
+
+# Show max surv
+
+open_closed <- ggplot(plot_dat |> mutate(canopy = factor(canopy, labels = canopy_types)), 
+                      mapping = aes(x = ht, y = pr)) + 
+  geom_line(mapping = aes(color = canopy), 
+            lwd = 1, alpha = 0.25) + 
+  geom_line(mapping = aes(x = ht, y = pr_max, 
+                          color = canopy), 
+            lwd = 1.25, alpha = 0.5) + 
+  scale_color_manual(name = "Canopy Gap", values = c("#335599", "#447744", "#883388")) + 
+  # scale_linetype_manual(values = c(3,2,1), name = "Canopy Gap") + 
+  theme_bw() + labs(x = "Height (cm)", y = "Survival") + 
+  facet_wrap(~spp[species]) 
+open_closed
+
+# Figure: Survival by canopy and canopy gap class (open/closed)
+ggsave(filename = "../Images/survival_canopy.png", plot = open_closed, 
+       height = 6, width = 8)
+
+
+write.csv(x = result_table |> arrange(spp, canopy), file = paste0("../Data/Output/result_table_surv", length(canopy), ".csv"))
+
+```
+
+
+
+```{r}
+#| label: Species survival
+#| code-fold: true
+#| code-summary: Overall survival 
+pander::pander(surv_props |>  mutate(spp = spp_names[spp]), caption = "Species Overall Survival Proportions")
+
+```
+
+```{r}
+#| label: Species by light class survival
+#| code-fold: true
+#| code-summary: Survival by light class
+pander::pander(result_table |> mutate(spp = spp_names[spp]), caption = "Survival Proportions")
+
+```
+
+## Breakage
+
+```{r}
+#| label: Breakage model
+#| code-fold: true
+#| code-summary: Breakage model
+
+crown_classes = unlist(canopy_list)
+canopy_classes = factor(rep(1:length(canopy_list), unlist(lapply(canopy_list, length))))
+
+U <- seedlings.upd
+U$grow <- U$HT_23 - U$HT_22
+U$grow21 <- U$HT_22 - U$HT_21
+
+U.break <- U |> filter(Species_23 %in% spp) |> 
+  mutate(break.yr = ifelse(grow21 < min_grow, yes = 2021, 
+                           no = ifelse(grow < min_grow, yes = 2022, no = NA))) |> 
+  group_by(Species_23) |> 
+  mutate(out_of = n()) |> ungroup() |> 
+  group_by(Species_23, break.yr) |> 
+  
+  summarise(
+    count = n(),
+    out_of = unique(out_of),
+    grow.21 = mean(grow21, na.rm = T), 
+    grow.22 = mean(grow, na.rm = T), 
+    alive_21 = sum(ST_21 == "A", na.rm = T), 
+    alive_22 = sum(ST_22 == "A", na.rm = T), 
+    alive_23 = sum(ST_23 == "A", na.rm = T))
+
+psurv21 <- U |> filter(ST_21 == "A", Species_23 %in% spp) |> 
+  group_by(Species_23) |> 
+  summarise(prop_dead    = mean(ST_22 == "D"), 
+            prop_missing = mean(ST_22 %in% c("CFS", "M")),
+            prop_alive   = mean(ST_22 == "A"), 
+            prop_break   = mean(grow21 < min_grow, na.rm = T), 
+            avg_break    = mean(grow21[grow21 < min_grow], na.rm = T),
+            sd_break     = sd(grow21[grow21 < min_grow], na.rm = T),
+            count = n())
+
+psurv22 <- U |> filter(ST_22 == "A", Species_23 %in% spp) |> 
+  group_by(Species_23) |> 
+  summarise(prop_dead    = mean(ST_23 == "D"), 
+            prop_missing = mean(ST_23 %in% c("CFS", "M")),
+            prop_alive   = mean(ST_23 == "A"), 
+            prop_break   = mean(grow < min_grow, na.rm = T), 
+            avg_break    = mean(grow[grow < min_grow], na.rm = T),
+            sd_break     = sd(grow[grow < min_grow], na.rm = T),
+            count = n())
+
+psurv_overall <- 
+  rbind(psurv21 |> mutate(year = "21-22"), 
+        psurv22 |> mutate(year = "22-23"))
+
+psurv_spp <- psurv_overall |> group_by(Species_23) |> 
+  summarise(mu.prop_dead = mean(prop_dead),
+            mu.prop_missing = mean(prop_missing),
+            mu.prop_alive = mean(prop_alive), 
+            mu.prop_break = mean(prop_break), 
+            mu.break = mean(avg_break, na.rm = T))
+
+pander::pander(psurv_spp)
+write.csv(x = psurv_spp, file = "../Data/Output/break_avg.csv", row.names = F)
+write.csv(x = psurv_overall, file = "../Data/Output/break_by_yr.csv", row.names = F)
+
+
+
+```
+
+
+```{r}
+#| label: Light Class survival
+#| code-fold: true
+#| code-summary: Suvival in gaps
+
+plsurv21 <- U |> filter(ST_21 == "A", Species_23 %in% spp) |> 
+  mutate(canopy = canopy_classes[match(Crown_Class_22, crown_classes)]) |> 
+  group_by(Species_23, canopy) |> 
+  summarise(prop_dead    = mean(ST_22 == "D"), 
+            prop_missing = mean(ST_22 %in% c("CFS", "M")),
+            prop_alive   = mean(ST_22 == "A"), 
+            prop_break   = mean(grow21 < min_grow, na.rm = T), 
+            avg_break    = mean(grow21[grow21 < min_grow], na.rm = T),
+            sd_break     = sd(grow21[grow21 < min_grow], na.rm = T),
+            n_break = sum(grow21 < min_grow, na.rm = T),
+            count = n())
+
+plsurv22 <- U |> filter(ST_21 == "A", Species_23 %in% spp) |> 
+  mutate(canopy = canopy_classes[match(Crown_Class_23, crown_classes)]) |> 
+  group_by(Species_23, canopy) |> 
+  summarise(prop_dead    = mean(ST_23 == "D"), 
+            prop_missing = mean(ST_23 %in% c("CFS", "M")),
+            prop_alive   = mean(ST_23 == "A"), 
+            prop_break   = mean(grow < min_grow, na.rm = T), 
+            avg_break    = mean(grow[grow < min_grow], na.rm = T),
+            sd_break     = sd(grow[grow < min_grow], na.rm = T),
+            n_break = sum(grow21 < min_grow, na.rm = T),
+            count = n())
+
+plsurv_overall <- 
+  rbind(plsurv21 |> mutate(year = "21-22"), 
+        plsurv22 |> mutate(year = "22-23") |> filter(!is.na(canopy)))
+
+plsurv_spp <- plsurv_overall |> group_by(Species_23, canopy) |> 
+  summarise(mu.prop_dead = mean(prop_dead),
+            mu.prop_missing = mean(prop_missing),
+            mu.prop_alive = mean(prop_alive), 
+            mu.prop_break = mean(prop_break), 
+            mu.break = mean(avg_break, na.rm = T))
+
+pander::pander(plsurv_spp)
+write.csv(x = plsurv_spp, file = "../Data/Output/break_avg_gap.csv", row.names = F)
+write.csv(x = plsurv_overall, file = "../Data/Output/break_by_yr_gap.csv", row.names = F)
+
+
+
+
+```
+
+
+```{r}
+#| label: Break coefficients
+#| code-fold: true
+#| code-summary: Breakage coefficients
+# Break Coefficient ----------------------
+break_coefs <- data.frame(species = spp, intercept = NA, slope = NA, mu = NA, 
+                          beta = NA, sd.beta = NA, p = NA, n = NA, obs = NA)
+si = 1
+par(mfrow = c(2, 3))
+for(si in 1:length(spp)){
+  
+  # Status categories: Missing (M), Can't find seedling (CFS), Previous (P)
+  # None of the entries with "previous" have height in 2021. 
+  # View(U |> filter(ST_21 == "P"))
+  sp_i <- U |> filter(Species_23 == spp[si])
+  
+  # There exists a maximum amount which can be broken, which increases linearly.  
+  break21 <- sp_i |> filter(ST_21 == "A", grow21 <  min_grow)
+  break22 <- sp_i |> filter(ST_22 == "A", grow   <  min_grow)
+  # If it breaks, what is the break size?
+  
+  break_set <- data.frame(x = c(break21$HT_21, break22$HT_22),
+                          y = c(break21$grow21, break22$grow))
+  
+  plot(break_set, ylim = c(-max(break_set$x), 0), xlim = c(0, max(break_set$x)),
+       xlab = "Height", ylab = "Breakage", 
+       main = spp[si])
+  break_lm <- lm(y ~ x, data = break_set)
+  abline(h = 0, col = "#bbaadd99", lwd = 2)
+  abline(break_lm)
+  abline(a = 0, b = -1, lty = "dashed", col = "#55555555")
+  break_coefs[si , c("intercept", "slope")] <- coef(break_lm)
+  break_coefs[si, "mu"] <- mean(break_set$y)
+  
+  break_coefs[si, "beta"]    <- summary(break_lm)$coefficients["x", "Estimate"]
+  break_coefs[si, "sd.beta"] <- summary(break_lm)$coefficients["x", "Std. Error"]
+  break_coefs[si, "p"]       <- summary(break_lm)$coefficients["x", "Pr(>|t|)"]
+  break_coefs[si, "n"]       <- nrow(sp_i)
+  break_coefs[si, "obs"]     <- psurv21$count[si] + psurv22$count[si]
+}
+break_coefs
+
+write.csv(x = break_coefs, file = "../Data/Output/break_coefs.csv", row.names = F)
+
+```
+
+## Growth Variation
+
+```{r}
+#| label: Growth variances
+#| code-fold: true
+#| code-summary: Individual seedling growth variances
+
+grow_var <- expand.grid(Species = spp, Canopy = canopy)
+grow_var$sd <- NA
+grow_var$mu <- NA
+grow_var$med21 <- NA
+grow_var$med22 <- NA
+
+par(mfrow = c(1, 2))
+for(si in 1:length(spp)){
+  for(ci in 1:length(canopy_list)){
+    which_grow_var <- which(grow_var$Species == spp[si] & grow_var$Canopy == canopy[ci])
+    
+ 
+    A_i <- A |> filter(Species_23 == spp[si] & Crown_Class_22 %in% canopy_list[[ci]])
+    
+    # Adjust IQR to 1 sigma radius.
+    grow_var$sd[which_grow_var] <- 
+      (2 / diff(qnorm(p = c(0.25, 0.75)))) *  # Adjustment to IQR
+      diff(quantile(A_i$grow - A_i$grow21, probs = c(0.25, 0.75), na.rm = T)) /  # IQR component
+      (2 * sqrt(2))  # Halves IQR and adjusts for difference of two random variables.
+ 
+    # Place overlaid curve
+    growth_grid <- seq(from = -2, to = 2, length.out = 100)
+
+  }
+}
+par(mfrow = c(1, 1))
+
+write.csv(x = grow_var, file = "../Data/Output/growth_variances.csv", row.names = F)
+pander::pander(grow_var)
+
+```
+
+## Growth Curves
+
+```{r}
+#| label: Bootstrap Logistic fits
+#| code-summary: Bootstrapping of growth models
+#| code-fold: true
+#| warning: false
+#| error: false
+#| results: false
+
+starts        <- read.csv(file = "../Data/nls_starts.csv")
+starts.ricker <- read.csv(file = "../Data/nls_ricker_starts.csv")
+starts.gompertz <- read.csv(file = "../Data/nls_gompertz_starts.csv")
+
+# Expand starts if using 3 classes.
+if(length(canopy) == 3){
+  starts          <- starts[         c(1,2,2,3,4,4,5,6,6,7,8,8,9,10,10), ]
+  starts.ricker   <- starts.ricker[  c(1,2,2,3,4,4,5,6,6,7,8,8,9,10,10), ]
+  starts.gompertz <- starts.gompertz[c(1,2,2,3,4,4,5,6,6,7,8,8,9,10,10), ]
+  starts$canopy = starts.ricker$canopy =  starts.gompertz$canopy <- rep(1:3, 5)
+}
+# Output:
+
+boot_nls <- vector(mode = "list")
+
+xgrid <- seq(from = 0, to = 400, length.out = 101)
+bi = 1
+si = 1
+ci = 1
+qr.mods <- data.frame()
+qr.logistic <- data.frame()
+qr.ricker   <- data.frame()
+qr.gompertz <- data.frame()
+dat <- list()
+si = 1
+ci = 1
+for(si in 1:length(spp)){
+  dat[[si]] <- list()
+  par(mfrow = c(1, length(canopy)))
+  
+  sp_dat <- A |> filter(Species_23 == spp[si], grow21 > min_grow, grow21 < max_grow, HT_22 >= min_h)
+  sp_max_growth <- max(c(sp_dat$grow, sp_dat$grow21), na.rm = T)
+  
+  for(ci in 1:length(canopy_list)){
+    dat[[si]][[ci]] <- list()
+    
+    which_starts   <- which(starts$spp == spp[si] & starts$canopy == canopy[ci])
+ 
+    # Use gap definition from 2022?
+    if(gap22){
+      
+      A21_i <- A |> filter(Species_23 == spp[si], 
+                           Crown_Class_22 %in% canopy_list[[ci]], 
+                           grow21 > min_grow, grow21 < max_grow, 
+                           HT_22 >= min_h)
+      
+      A22_i <- A |> filter(Species_23 == spp[si], 
+                     Crown_Class_22 %in% canopy_list[[ci]], 
+                     grow > min_grow, grow < max_grow, 
+                     HT_23 >= min_h)
+      
+    }else{
+      
+      A21_i <- A |> filter(Species_23 == spp[si], 
+                     Crown_Class_22 %in% canopy_list[[ci]], 
+                     grow21 > min_grow, grow21 < max_grow, 
+                     HT_21 >= min_h)
+      
+      A22_i <- A |> filter(Species_23 == spp[si], 
+                     Crown_Class_23 %in% canopy_list[[ci]], 
+                     grow > min_grow, grow < max_grow, 
+                     HT_22 >= min_h)
+      
+    }
+    
+
+    dat_i = data.frame(x = c(A22_i$HT_22, A21_i$HT_21), 
+                       y = c(A22_i$grow, A21_i$grow21), 
+                       p = canopy_classes[match(c(A22_i$Crown_Class_23, A21_i$Crown_Class_22), crown_classes)])
+    
+    start_li <- starts[which_starts, c("a", "b", "c")]
+    start_ri <- starts.ricker[which_starts, c("a", "b")]
+    start_gi <- starts.gompertz[which_starts, c("a", "b", "c")]
+    
+
+    
+    # Initial curves attempted.
+    plot(dat_i$x, dat_i$y, xlim = c(0, 150), ylim = c(-2, sp_max_growth), main = paste(spp[si], ci),
+         pch = as.character(dat_i$p), col = c("#ff881130", "#55225533")[as.numeric(dat_i$p)])
+
+    dat[[si]][[ci]]$logistic <- 
+      try(nls(y ~ SSlogis(x, a, b, c), data = dat_i, start = start_li))
+    
+    dat[[si]][[ci]]$ricker <- try(nls(y ~ SSricker(x, a, b), data = dat_i, start = start_ri))
+    
+    dat[[si]][[ci]]$gompertz <- try(nls(y ~ SSgompertz(x, a, b, c), data = dat_i, start = start_gi))
+    
+    
+    dat[[si]][[ci]]$logistic.qr90 <- 
+      try(nlrq(y ~ SSlogis(x, a, b, c), data = dat_i, start = start_li, tau = tau))
+    
+    dat[[si]][[ci]]$ricker.qr90 <- try(nlrq(y ~ SSricker(x, a, b), data = dat_i, start = start_ri, tau = tau))
+    
+    dat[[si]][[ci]]$gompertz.qr90 <- try(nlrq(y ~ SSgompertz(x, a, b, c), data = dat_i, start = start_gi, tau = tau))
+    
+    # Logistic
+    if(is.character(dat[[si]][[ci]]$logistic)){
+      print(x = paste("Logistic Not fit:", spp[si], canopy[ci]))
+      
+      dat[[si]][[ci]]$logistic.boot <- 
+        boot(data = dat_i, statistic = boot_stat, R = boots, sim = "parametric", 
+             # parallel = "multicore", ncpus = 6,
+             ran.gen = boot_rand, new_start = start_li)
+      
+      cat(paste("\n\033[34mFit Ratio Logistic (boot):\033[0m",
+                round(mean(complete.cases(dat[[si]][[ci]]$logistic.boot$t)), 3),
+                spp[si], canopy[ci], "\n"))
+      
+      
+    }else{
+      
+      dat[[si]][[ci]]$logistic.boot <- 
+        boot(data = dat_i, statistic = boot_stat, R = boots, sim = "parametric", 
+             ran.gen = boot_rand, new_start = start_li)
+      
+      cat(paste("\n\033[34mFit Ratio Logistic:\033[0m",
+                round(mean(complete.cases(dat[[si]][[ci]]$logistic.boot$t)), 3),
+                spp[si], canopy[ci], "\n"))
+      
+    }
+    
+    (logis_i <-   apply(dat[[si]][[ci]]$logistic.boot$t, MARGIN = 2, FUN = median, na.rm = T))
+    lines(1:150, SSlogis(input = 1:150,
+                   Asym = logis_i[1],
+                   xmid = logis_i[2],
+                   scal = logis_i[3]),
+    col = "#5555dd", lwd = 2)
+
+    # Ricker
+    if(is.character(dat[[si]][[ci]]$ricker)){
+      print(x = paste("Ricker Not fit:", spp[si], canopy[ci]))
+      
+      dat[[si]][[ci]]$ricker.boot <- 
+        boot(data = dat_i, statistic = boot_ricker, R = boots, sim = "parametric", 
+             ran.gen = boot_rand, new_start = start_ri)
+      
+      cat(paste("\n\033[33mFit Ratio Ricker (boot):\033[0m",
+                round(mean(complete.cases(dat[[si]][[ci]]$ricker.boot$t)), 3),
+                spp[si], canopy[ci], "\n"))
+      
+    }else{
+      
+      dat[[si]][[ci]]$ricker.boot <- boot_nls(dat[[si]][[ci]]$ricker, R = boots)
+      cat(paste("\n\033[33mFit Ratio Ricker:\033[0m",
+                round(mean(complete.cases(dat[[si]][[ci]]$ricker.boot$t)), 3),
+                spp[si], canopy[ci]))
+    } 
+    
+    
+    # Gompertz
+    if(is.character(dat[[si]][[ci]]$gompertz)){
+      cat(x = paste("\n\033[32m\nGompertz Not fit:", spp[si], canopy[ci], "\033[0m"))
+      
+      dat[[si]][[ci]]$gompertz.boot <- 
+        boot(data = dat_i, statistic = boot_gompertz, R = boots, sim = "parametric", 
+             ran.gen = boot_rand, new_start = start_gi, ncpus = 6)
+      
+      cat(paste("\n\033[32mFit Ratio Gompertz (boot):\033[0m",
+                round(mean(complete.cases(dat[[si]][[ci]]$gompertz.boot$t)), 3),
+                spp[si], canopy[ci]),"\n")
+      
+    }else{
+      
+      dat[[si]][[ci]]$gompertz.boot <- boot_nls(dat[[si]][[ci]]$gompertz, R = boots)
+      print(paste("Fit Ratio Gompertz:",
+                  round(mean(complete.cases(dat[[si]][[ci]]$gompertz.boot$t)), 3),
+                  spp[si], canopy[ci]))
+    }
+    
+    
+    # Add QR lines:
+    
+    if(!is.character(dat[[si]][[ci]]$logistic.qr90)){
+      q90_coef <- coef(dat[[si]][[ci]]$logistic.qr90)
+      
+      qr.mod <- data.frame(mod = "logistic", species = si, canopy = ci, quantile = tau)
+      qr.mod[1, c("a", "b", "c")] <- q90_coef
+      qr.mods <- rbind(qr.mods, qr.mod)
+      qr.logistic <- rbind(qr.logistic, qr.mod)
+      
+    }else{
+      qr.mod <- data.frame(mod = "logistic", species = si, canopy = ci, quantile = tau)
+      qr.mod[1, c("a", "b", "c")] <- rep(NA, 3)
+      qr.mods <- rbind(qr.mods, qr.mod)
+      qr.logistic <- rbind(qr.logistic, qr.mod)
+    }
+    
+    # Q90 Ricker
+    if(!is.character(dat[[si]][[ci]]$ricker.qr90)){
+      q90_coef <- coef(dat[[si]][[ci]]$ricker.qr90)
+      
+      qr.mod <- data.frame(mod = "ricker", species = si, canopy = ci, quantile = tau)
+      qr.mod[1, c("a", "b", "c")] <- c(q90_coef, c = NA)
+      qr.mods <- rbind(qr.mods, qr.mod)
+      qr.ricker <- rbind(qr.ricker, qr.mod)
+      
+    }else{
+      qr.mod <- data.frame(mod = "ricker", species = si, canopy = ci, quantile = tau)
+      qr.mod[1, c("a", "b", "c")] <- rep(NA, 3)
+      qr.mods <- rbind(qr.mods, qr.mod)
+      qr.ricker <- rbind(qr.ricker, qr.mod)
+    }
+    
+    #Q90 Gompertz
+    if(!is.character(dat[[si]][[ci]]$gompertz.qr90)){
+      q90_coef <- coef(dat[[si]][[ci]]$gompertz.qr90)
+      
+      qr.mod <- data.frame(mod = "gompertz", species = si, canopy = ci, quantile = tau)
+      qr.mod[1, c("a", "b", "c")] <- q90_coef
+      qr.mods <- rbind(qr.mods, qr.mod)
+      qr.gompertz <- rbind(qr.gompertz, qr.mod)
+    }else{
+      qr.mod <- data.frame(mod = "gompertz", species = si, canopy = ci, quantile = tau)
+      qr.mod[1, c("a", "b", "c")] <- rep(NA, 3)
+      qr.mods <- rbind(qr.mods, qr.mod)
+      qr.gompertz <- rbind(qr.gompertz, qr.mod)
+    }
+    
+  }
+  
+}
+par(mfrow = c(1, 1))
+
+
+write.csv(file = paste0("../Data/Output/quantile", tau, ".csv"), x = qr.mods)
+
+
+```
+
+
+
+```{r}
+#| label: Model outputs
+#| code-fold: true
+#| code-summary: Parameters fit and model output
+
+logistic_result <- data.frame()
+ricker_result   <- data.frame()
+gompertz_result   <- data.frame()
+
+si = 1; ci = 1
+for(si in 1:length(spp)){
+  for(ci in 1:length(canopy)){
+    logistic_ti  <- dat[[si]][[ci]]$logistic.boot$t
+    ricker_ti   <- dat[[si]][[ci]]$ricker.boot$t
+    gompertz_ti   <- dat[[si]][[ci]]$gompertz.boot$t
+    
+    logistic_ti <- cbind(rep(si, nrow(logistic_ti)) , rep(ci, nrow(logistic_ti)), logistic_ti)
+    ricker_ti   <- cbind(rep(si, nrow(ricker_ti)),    rep(ci, nrow(ricker_ti)),   ricker_ti)
+    gompertz_ti   <- cbind(rep(si, nrow(gompertz_ti)),    rep(ci, nrow(gompertz_ti)),   gompertz_ti)
+    
+    logistic_result <- rbind(logistic_result, logistic_ti[complete.cases(logistic_ti), ])
+    ricker_result   <- rbind(ricker_result, ricker_ti[complete.cases(ricker_ti), ])
+    gompertz_result   <- rbind(gompertz_result, gompertz_ti[complete.cases(gompertz_ti), , drop = F])
+    
+    
+  }
+}
+
+
+
+names(logistic_result) <- c("spp", "canopy", "a", "b", "c")
+names(ricker_result)   <- c("spp", "canopy", "a", "b")
+names(gompertz_result)   <- c("spp", "canopy", "a", "b", "c")
+
+logistic_table <- logistic_result |> group_by(spp, canopy) |> 
+  summarise(
+    a.mu = mean(a), 
+    a.sd = sd(a), 
+    a.05 = quantile(a, probs = 0.05), 
+    a.50 = quantile(a, probs = 0.50), 
+    a.95 = quantile(a, probs = 0.95), 
+    b.mu = mean(b),
+    b.sd = sd(b),
+    b.05 = quantile(b, probs = 0.05), 
+    b.50 = quantile(b, probs = 0.50), 
+    b.95 = quantile(b, probs = 0.95), 
+    c.mu = mean(c),
+    c.sd = sd(c),
+    c.05 = quantile(c, probs = 0.05), 
+    c.50 = quantile(c, probs = 0.50), 
+    c.95 = quantile(c, probs = 0.95), 
+  ) |> 
+  mutate(spp = spp_names[spp])
+panderOptions('table.split.table', Inf) 
+pander(logistic_table, caption = "Logistic Coefficients")
+canopy_state <- ifelse(test = gap22, yes = "_2022_canopy", no = "")
+write.csv(x = logistic_table, file = paste0("../Data/Output/nls_logistic_curves", boots, canopy_state, ".csv"), row.names = F)
+
+# Ricker:
+
+ricker_table <- ricker_result |> group_by(spp, canopy) |> 
+  summarise(
+    a.mu = mean(a), 
+    a.sd = sd(a), 
+    a.05 = quantile(a, probs = 0.05), 
+    a.50 = quantile(a, probs = 0.50), 
+    a.95 = quantile(a, probs = 0.95), 
+    b.mu = mean(b),
+    b.sd = sd(b),
+    b.05 = quantile(b, probs = 0.05), 
+    b.50 = quantile(b, probs = 0.50), 
+    b.95 = quantile(b, probs = 0.95), 
+  ) |> 
+  mutate(spp = spp_names[spp])
+
+if(simulate_ricker == T){
+  pander(ricker_table, caption = "Ricker Coefficients")
+}
+write.csv(x = ricker_table, file = paste0("../Data/Output/nls_curves", boots, canopy_state, ".csv"), row.names = F)
+
+# Gompertz
+gompertz_table <- gompertz_result |> group_by(spp, canopy) |> 
+  summarise(
+    a.mu = mean(a), 
+    a.sd = sd(a), 
+    a.05 = quantile(a, probs = 0.05), 
+    a.50 = quantile(a, probs = 0.50), 
+    a.95 = quantile(a, probs = 0.95), 
+    b.mu = mean(b),
+    b.sd = sd(b),
+    b.05 = quantile(b, probs = 0.05), 
+    b.50 = quantile(b, probs = 0.50), 
+    b.95 = quantile(b, probs = 0.95), 
+    c.mu = mean(c),
+    c.sd = sd(c),
+    c.05 = quantile(c, probs = 0.05), 
+    c.50 = quantile(c, probs = 0.50), 
+    c.95 = quantile(c, probs = 0.95), 
+  ) |> 
+  mutate(spp = spp_names[spp])
+panderOptions('table.split.table', Inf) 
+if(simulate_gompertz == T){
+  pander(gompertz_table, caption = "Gompertz Coefficients")
+}
+write.csv(x = gompertz_table, file = paste0("../Data/Output/nls_gompertz_curves", boots, canopy_state, ".csv"), row.names = F)
+
+
+
+
+```
+
+
+```{r}
+#| label: Overlay All Logistic
+#| code-fold: true
+#| code-summary: Logistic models fit
+
+dat_s <- logistic_table
+hgrid <- seq(from = 0, to = 300, length.out = 301)
+grid_fit <- data.frame()
+
+i = 1
+sp_seq <- rep(1:5, each = length(canopy))
+for(i in 1:nrow(dat_s)){
+  y_out <- SSlogis(input = hgrid, 
+                   Asym = dat_s[i, "a.50"][[1]], 
+                   xmid = dat_s[i, "b.50"][[1]], 
+                   scal = dat_s[i, "c.50"][[1]])
+  
+  if(!is.character(dat[[sp_seq[i]]][[dat_s$canopy[i]]]$logistic)){
+    # Fit curve:
+    coef_i <- coef(dat[[sp_seq[i]]][[dat_s$canopy[i]]]$logistic)
+    l_out <- SSlogis(input = hgrid, 
+                     Asym = coef_i[[1]], 
+                     xmid = coef_i[[2]], 
+                     scal = coef_i[[3]])
+  }else{
+    l_out <- rep(x = NA, length(hgrid))
+  }
+  
+  if(!is.character(dat[[sp_seq[i]]][[dat_s$canopy[i]]]$logistic.qr90)){
+    coef_i <- coef(dat[[sp_seq[i]]][[dat_s$canopy[i]]]$logistic.qr90)
+    # Fit curve:
+    q_out <- SSlogis(input = hgrid, 
+                     Asym = coef_i[[1]], 
+                     xmid = coef_i[[2]], 
+                     scal = coef_i[[3]])
+  }else{
+    q_out <- rep(x = NA, length(hgrid))
+  }
+  
+  grid_i <- data.frame(height = hgrid, 
+                       growth = y_out,
+                       growth.mean = l_out, 
+                       growth.q90 = q_out,
+                       spp = dat_s[i, "spp"], 
+                       canopy = dat_s[i, "canopy"], 
+                       model = "Logistic")
+  grid_fit <- rbind(grid_fit, grid_i)
+}
+
+ggplot(grid_fit |> mutate(canopy = factor(canopy)), 
+       mapping = aes(x = height, y = growth)) + 
+  geom_line(mapping = aes(lty = canopy)) + 
+  facet_wrap(~spp) +
+  theme_bw() + labs(title = "Logistic Fit") + 
+  lims(x = c(0, 150))
+
+
+```
+
+
+### Acer rubrum
+
+```{r, fig.height=7}
+#| label: ACERUB Plot
+#| code-fold: true
+#| code-summary: Acer rubrum growth curve overlaid on data
+par(mfrow = c(1, 1))
+si = 1
+plot_spp(si = si, line_alpha = 0.01, point_alpha = 0.05, max_grow = 15)
+
+```
+
+
+```{r, fig.height=3}
+#| label: ACERUB Histograms
+#| code-fold: true
+#| code-summary: Acer rubrum histogram for parameters
+
+
+for(ci in 1:length(canopy)){
+  try(plot_par(par_dat = dat[[si]][[ci]]$logistic.boot$t, 
+               par_names = paste(spp[si], "Canopy", canopy[ci], c("\nA", "\nB", "\nC"))))
+}
+
+```
+
+### Betula spp.
+
+```{r}
+#| label: Species 2, BETSP
+#| code-fold: true
+#| code-summary: Betula species curves overlaid on data
+
+si = 2
+plot_spp(si = si, line_alpha = 0.005, point_alpha = 0.1, max_grow = 80)
+
+```
+
+```{r, fig.height=3}
+#| label: BETSP Histogram
+#| code-fold: true
+#| code-summary: Betula species paramter histograms
+
+
+for(ci in 1:length(canopy)){
+  try(plot_par(par_dat = dat[[si]][[ci]]$logistic.boot$t, 
+               par_names = paste(spp[si], "Canopy", canopy[ci], c("\nA", "\nB", "\nC"))))
+}
+
+```
+
+### Pinus strobus
+
+```{r, fig.height=7}
+#| label: Species 2, PINSTR
+#| code-fold: true
+#| code-summary: Pinus strobus curves overlaid on data
+
+si = 3
+plot_spp(si = si, line_alpha = 0.0025, point_alpha = 0.1)
+
+```
+
+```{r, fig.height=3}
+#| label: PINSTR Histogram
+#| code-fold: true
+#| code-summary: Pinus strobus curves overlaid on data
+
+
+for(ci in 1:length(canopy)){
+  try(plot_par(par_dat = dat[[si]][[ci]]$logistic.boot$t, 
+               par_names = paste(spp[si], "Canopy", canopy[ci], c("\nA", "\nB", "\nC"))))
+}
+
+```
+
+### Quercus rubra 
+
+```{r, fig.height=7}
+#| label: Species 4, QUERUB
+#| code-fold: true
+#| code-summary: Quercus rubra curves overlaid on data
+
+si = 4
+plot_spp(si = si, line_alpha = 0.005, point_alpha = 0.15)
+
+
+```
+
+```{r, fig.height=3}
+#| label: QUERUB Histogram
+#| code-fold: true
+#| code-summary: Quercus rubra parameter histogram
+
+for(ci in 1:length(canopy)){
+  try(plot_par(par_dat = dat[[si]][[ci]]$logistic.boot$t, 
+               par_names = paste(spp[si], "Canopy", canopy[ci], c("\nA", "\nB", "\nC"))))
+}
+
+```
+
+### Tsuga canadensis
+
+```{r, fig.height=7}
+#| label: Species 5, TSUCAN
+#| code-fold: true
+#| code-summary: Tsuga canadensis curves overlaid on data
+
+si = 5
+plot_spp(si, line_alpha = 0.0025, point_alpha = 0.15)
+
+
+```
+
+```{r, fig.height=3}
+#| label: TSUCAN Histogram
+#| code-fold: true
+#| code-summary: Tsuga canadensis parameter histogram
+
+for(ci in 1:length(canopy)){
+  try(plot_par(par_dat = dat[[si]][[ci]]$logistic.boot$t, 
+               par_names = paste(spp[si], "Canopy", canopy[ci], c("\nA", "\nB", "\nC"))))
+}
+
+```
+
+
+# Simulations
+
+```{r}
+#| label: IBM
+#| code-summary: Individual based model
+#| code-fold: true
+
+# Growth parameters
+logistic_table$species <- rep(1:5, each = length(canopy_list))
+ricker_table$species   <- rep(1:5, each = length(canopy_list))
+gompertz_table$species <- rep(1:5, each = length(canopy_list))
+
+
+
+# Assuming the growth_function4.R file is available and properly defined.
+source("../Code/growth_function4.R")
+
+num_to_ht <- numeric(trials)
+num_needed <- numeric(trials)
+time_to_ht <- numeric(trials)
+
+# Create an empty matrix to store results
+result_matrix <- matrix(NA, ncol = 7, nrow = length(spp) * length(canopy))
+colnames(result_matrix) <- c("num_to_ht", "num_needed", 
+                             "min_time_to_ht", "med_time_to_ht", 
+                             "species", "canopy", "trial")
+
+logistic_matrix <- ricker_matrix <- gompertz_matrix <- result_matrix
+
+result_set <- data.frame()
+
+## trials 
+# Loop through each species
+si = 1; ci = 1; ti = 1
+for(ti in 1:trials){
+  for (si in 1:length(spp)) {
+  # Loop through each canopy
+    for (ci in 1:length(canopy)) {
+      which_grow_var <- which(grow_var$Species == spp[si] & grow_var$Canopy == canopy[ci])
+      
+      # Extract a0 and a1 values from dat_surv for the specific species and canopy
+      a0 <- dat_surv$estimate[dat_surv$spp == si & dat_surv$canopy == ci & dat_surv$term == "(Intercept)"]
+      a1 <- dat_surv$estimate[dat_surv$spp == si & dat_surv$canopy == ci & dat_surv$term == "HT1"]
+      # a1 = .10
+      
+      if(seedling_variance == F){
+        par_se = 0  ## Fixed growth correlation coefficient 
+      }else{
+        par_se = grow_var$sd[which_grow_var]  ## growth correlation coefficient 
+      }
+      
+      # Specify ht2 based on species --stochastic --give different hts for all initial seedlings 
+      sp_set <- rep(si, n_seedling)
+      ht <- get_ht(sp_n = sp_set)
+      
+      
+      if(breakage == F){
+        break_mean = 0
+        break_prop = 0
+      }else{
+        break_mean <- psurv_spp[[si, "mu.break"]]
+        break_prop <- psurv_spp[[si, "mu.prop_break"]]
+      }
+      
+      if(sample_curves == T){
+        logistic_samp <- logistic_result |> filter(spp == si, canopy == ci) |> 
+        sample_n(size = n_seedling, replace = T)
+        par_se <- 0 # Remove the random effect, replace with curve sampling.
+      }else{
+        logistic_samp <- data.frame(
+            a = rep(logistic_table$a.mu[logistic_table$spp == spp[si] & 
+                                          logistic_table$canopy == ci], n_seedling),
+            b = rep(logistic_table$b.mu[logistic_table$spp == spp[si] & 
+                                          logistic_table$canopy == ci], n_seedling),
+            c = rep(logistic_table$c.mu[logistic_table$spp == spp[si] & 
+                                          logistic_table$canopy == ci], n_seedling)
+          )
+        # logistic_result |> filter(spp == si, canopy == ci) |> 
+        # sample_n(size = n_seedling, replace = T)
+      }
+      
+      
+      result_logistic <- simulate_tree_growth(
+        t = timesteps, n = n_seedling, 
+        a0 = a0, a1 = a1, 
+        a = logistic_samp$a,
+        b = logistic_samp$b,
+        c = logistic_samp$c,
+        ht_initial = ht, sd = par_se,
+        msurv = surv_props$surv_sp_canopy_max[surv_props$spp == si & surv_props$canopy == ci], 
+        break_mean = break_mean, 
+        break_prop = break_prop, 
+        form = "logistic")
+      
+      if(simulate_ricker == T){
+        result_ricker <- simulate_tree_growth(
+        t = timesteps, n = n_seedling, 
+        a0 = a0, a1 = a1, 
+        a = rep(ricker_table$a.mu[ricker_table$spp == spp[si] & ricker_table$canopy == ci], n_seedling), 
+        b = rep(ricker_table$b.mu[ricker_table$spp == spp[si] & ricker_table$canopy == ci], n_seedling), 
+        c = rep(NA, n_seedling),
+        ht_initial = ht, sd = par_se,
+        msurv = surv_props$surv_sp_canopy_max[surv_props$spp == si & surv_props$canopy == ci], 
+        break_mean = break_mean, 
+        break_prop = break_prop, 
+        form = "ricker")
+        
+        ricker_matrix[index, ]   <- c(summarise_results(result_ricker  ), si, ci, ti)
+        # cat(".")
+      }
+      
+      
+      if(simulate_gompertz == T){
+        result_gompertz <- simulate_tree_growth(
+        t = timesteps, n = n_seedling, 
+        a0 = a0, a1 = a1, 
+        a = rep(gompertz_table$a.mu[gompertz_table$spp == spp[si] & gompertz_table$canopy == ci], n_seedling), 
+        b = rep(gompertz_table$b.mu[gompertz_table$spp == spp[si] & gompertz_table$canopy == ci], n_seedling), 
+        c = rep(gompertz_table$c.mu[gompertz_table$spp == spp[si] & gompertz_table$canopy == ci], n_seedling),
+        ht_initial = ht, sd = par_se,
+        msurv = surv_props$surv_sp_canopy_max[surv_props$spp == si & surv_props$canopy == ci], 
+        break_mean = break_mean, 
+        break_prop = break_prop, 
+        form = "gompertz")
+        
+        gompertz_matrix[index, ] <- c(summarise_results(result_gompertz), si, ci, ti)
+        # cat(".")
+      }
+      
+      
+      # Calculate the index for storing results
+      index <- (si - 1) * length(canopy) + ci 
+      
+      # Store results in the matrix
+      logistic_matrix[index, ] <- c(summarise_results(result_logistic), si, ci, ti)
+      
+      if(store_simulation == T){
+
+        scenario <- paste(spp_names[si], ci, "- trial", ti)
+        save(list = c("result_logistic", "scenario"), 
+             file = paste0("../Data/Output/Simulation/Logistic_", spp_names[si], ci, "_t", ti, ".Rdata"))
+      }
+      
+      simulation_ID <- ti
+      
+      # cat(paste0(ci, ", "))
+    } # Canopy
+    
+    # cat(paste0(spp[si], " "))
+  } # Species
+  
+  write.csv(x = logistic_matrix, 
+            file = paste0("../Data/Output/Model/Logistic_",sim_id,"_", ti, ".csv"), row.names = F)
+  
+  if(simulate_ricker){
+    write.csv(x = ricker_matrix, 
+            file = paste0("../Data/Output/Model/Ricker_",sim_id,"_", ti, ".csv"), row.names = F)
+  
+  }
+  
+  if(simulate_gompertz){
+    write.csv(x = gompertz_matrix, 
+            file = paste0("../Data/Output/Model/Gompertz_",sim_id,"_", ti, ".csv"), row.names = F)
+  
+  }
+  
+} # Trial
+
+
+```
+
+## Simulation results
+
+```{r}
+#| label: Logistic results
+#| code-fold: true
+#| code-summary: Logistic models
+
+logistic_trials <- data.frame()
+for(ti in 1:trials){
+    trial_i <- read.csv(file = paste0("../Data/Output/Model/Logistic_",sim_id,"_", ti, ".csv"))
+      logistic_trials <- rbind(logistic_trials, trial_i)
+}
+
+summary_df <- logistic_trials |> mutate(species = spp[species]) |> group_by(species, canopy) |>
+  summarise(num_to_ht = median(num_to_ht, na.rm = T),
+            num_needed = median(num_needed, na.rm = T),
+            min_time_to_ht = median(min_time_to_ht, na.rm = T) ,
+            med_time_to_ht = median(med_time_to_ht, na.rm = T) ,
+            trials = max(trial), .groups = "drop")
+
+
+overall_df <- logistic_trials |> mutate(species = spp[species]) |> 
+  # group_by(species, canopy) |>
+  summarise(num_to_ht = median(num_to_ht, na.rm = T),
+            num_needed = median(num_needed, na.rm = T),
+            min_time_to_ht = median(min_time_to_ht, na.rm = T) ,
+            med_time_to_ht = median(med_time_to_ht, na.rm = T) ,
+            trials = max(trial), .groups = "drop")
+
+gap_df <- logistic_trials |> mutate(species = spp[species]) |> 
+  group_by(canopy) |>
+  summarise(num_to_ht = median(num_to_ht, na.rm = T),
+            num_needed = median(num_needed, na.rm = T),
+            min_time_to_ht = median(min_time_to_ht, na.rm = T) ,
+            med_time_to_ht = median(med_time_to_ht, na.rm = T) ,
+            trials = max(trial), .groups = "drop")
+
+overall_df <- logistic_trials |> mutate(species = spp[species]) |> 
+  summarise(num_to_ht = median(num_to_ht, na.rm = T),
+            num_needed = median(num_needed, na.rm = T),
+            min_time_to_ht = median(min_time_to_ht, na.rm = T) ,
+            med_time_to_ht = median(med_time_to_ht, na.rm = T) ,
+            trials = max(trial), .groups = "drop")
+
+
+pander(summary_df, caption = "Species x Gap median")
+
+pander(gap_df, caption = "Gap median")
+
+pander(overall_df, caption = "Overall median")
+
+write.csv(x = summary_df, file = paste0("../Data/Output/IBM_logistic_",sim_id,  ".csv"))
+write.csv(x = logistic_trials, file = paste0("../Data/Output/IBM_logistic_",sim_id,  "_combined.csv"))
+```
+
+
+```{r}
+#| label: Ricker and Gompertz IBM outputs
+#| code-fold: true
+#| code-summary: Output for other functional forms (if fit)
+
+if(simulate_ricker){
+  
+  ricker_trials <- data.frame()
+  
+  for(ti in 1:trials){
+    for(si in 1:length(spp)){
+      for(ci in 1:length(canopy)){
+        # working with naming structure above,
+        trial_i <- read.csv(file = paste0("../Data/Output/Model/Ricker_",sim_id,"_", ti, ".csv"))
+        ricker_trials <- rbind(ricker_trials, trial_i)
+      }
+    }
+  }
+  
+  ricker_summary <- ricker_trials |> mutate(species = spp[species]) |> group_by(species, canopy) |>
+    summarise(num_to_ht = median(num_to_ht, na.rm = T),
+              num_needed = median(num_needed, na.rm = T),
+              min_time_to_ht = median(min_time_to_ht, na.rm = T) ,
+              med_time_to_ht = median(med_time_to_ht, na.rm = T) ,
+              trials = max(trial), .groups = "drop")
+  
+    pander(ricker_summary, caption = "Ricker IBM results")
+  }
+  
+  if(simulate_gompertz){
+
+    gompertz_trials <- data.frame()
+    
+    for(ti in 1:trials){
+      for(si in 1:length(spp)){
+        for(ci in 1:length(canopy)){
+          
+          # working with naming structure above,
+          trial_i <- read.csv(file = paste0("../Data/Output/Model/Gompertz_", sim_id, "_", ti, ".csv"))
+          gompertz_trials <- rbind(gompertz_trials, trial_i)
+        }
+      }
+    }
+    
+    gompertz_summary <- gompertz_trials |> mutate(species = spp[species]) |> group_by(species, canopy) |>
+      summarise(num_to_ht = median(num_to_ht, na.rm = T),
+                num_needed = median(num_needed, na.rm = T),
+                min_time_to_ht = median(min_time_to_ht, na.rm = T) ,
+                med_time_to_ht = median(med_time_to_ht, na.rm = T) ,
+                trials = max(trial), .groups = "drop")
+    
+    pander(gompertz_summary, caption = "Gompertz IBM results")
+
+    
+  }
+
+```
+
+
+
+
